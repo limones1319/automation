@@ -1,0 +1,318 @@
+---
+  - name: Provision an EC2 Instance
+    hosts: localhost
+    connection: local
+    gather_facts: False
+    tags: provisioning
+    # Necessary Variables for creating/provisioning the EC2 Instance
+    vars_files: 
+      - vars/variables.yml
+      - vars/auth.yml
+ 
+    # Task that will be used to Launch/Create an EC2 Instance
+    tasks:
+      -   name: Create security group
+          ec2_group:
+              aws_access_key: "{{ec2_access_key}}"
+              aws_secret_key: "{{ec2_secret_key}}"
+              name: "{{ project_name }}_security_group"
+              description: "{{ project_name }} security group"
+              region: "{{ aws_region }}"
+              rules:
+                  - proto: tcp
+                    from_port: 22
+                    to_port: 22
+                    cidr_ip: 0.0.0.0/0
+                  - proto: tcp
+                    from_port: 80
+                    to_port: 80
+                    cidr_ip: 0.0.0.0/0
+                  - proto: tcp
+                    from_port: 443
+                    to_port: 443
+                    cidr_ip: 0.0.0.0/0
+              rules_egress:
+                  - proto: all
+                    cidr_ip: 0.0.0.0/0
+          register: basic_firewall
+
+      -   name: Create an EC2 key
+          ec2_key:
+              aws_access_key: "{{ec2_access_key}}"
+              aws_secret_key: "{{ec2_secret_key}}"
+              name: "{{ project_name }}-key"
+              region: "{{ aws_region }}"
+          register: ec2_key
+
+      - name: save private key
+        copy:
+          content: "{{ ec2_key.key.private_key }}" 
+          dest: "private_keys/aws-private.pem" 
+          mode: 0600
+        when: ec2_key.changed
+
+      -   name: Create an EC2 instance
+          ec2:
+              aws_access_key: "{{ec2_access_key}}"
+              aws_secret_key: "{{ec2_secret_key}}"
+              key_name: "{{ project_name }}-key"
+              region: "{{ aws_region }}"
+              group_id: "{{ basic_firewall.group_id }}"
+              instance_type: "{{ instance_type }}"
+              image: "{{ ami }}"
+              wait: yes
+              count_tag: "{{ project_name }}"
+              exact_count: 1
+          register: ec2
+
+      - name: Add new instance to host group
+        add_host:
+          name: "{{ item.public_dns_name }}"
+          groups: launched
+          ansible_ssh_private_key_file: "private_keys/aws-private.pem"
+          ansible_user: ec2-user
+        with_items: "{{ ec2.tagged_instances }}"
+
+      - name: Add new host to zone compucorp.neimportant.ro so we can generate the Letsencrypt certificate
+        nsupdate:
+          key_name: "compucorp.neimportant.ro"
+          key_secret: "{{ named_key }}"
+          key_algorithm: hmac-md5
+          server: "127.0.0.1"
+          zone: "compucorp.neimportant.ro"
+          record: "cca3"
+          value: "{{ item.public_ip }}"
+        with_items: "{{ ec2.tagged_instances }}"
+
+      - name: Delete previously created .ssh/config file
+        file:
+          path: /home/ec2-user/.ssh/config
+          state: absent
+
+      - name: Add configs to SSH config file so we can 'ssh automate' directly
+        lineinfile:
+          path: /home/ec2-user/.ssh/config
+          line: "{{ item }}"
+          state: present
+          mode: 0600
+          create: yes
+        with_items:
+          - 'Host automate'
+          - 'HostName {{ ec2.tagged_instances[0].public_dns_name }}'
+          - 'User ec2-user'
+          - 'IdentityFile compucorp_ansible/private_keys/aws-private.pem'        
+
+      - name: Wait for SSH to come up
+        wait_for:
+          host: "{{ item.public_dns_name }}"
+          port: 22
+          delay: 60
+          timeout: 320
+          state: started
+        with_items: "{{ ec2.tagged_instances }}"
+
+  - name: Configure EC2 instance
+    hosts: launched
+    gather_facts: False
+    vars_files: 
+      - vars/variables.yml
+      - vars/auth.yml
+
+    tasks:
+      - name: install epel
+        yum: name=https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm state=present
+        become: true
+
+      - name: enable rhui
+        command: sudo yum-config-manager --enable rhui-REGION-rhel-server-extras rhui-REGION-rhel-server-optional
+
+      - name: install drush
+        yum: name=drush state=present
+        become: true
+
+      - name: install git
+        yum: name=git state=present
+        become: true
+
+      - name: install nginx with PHP and MariaDB
+        yum: name={{ item }} state=present
+        with_items:
+          - nginx 
+          - php-fpm 
+          - php-common
+          - php-opcache 
+          - php-pecl-apcu 
+          - php-cli 
+          - php-pear 
+          - php-pdo 
+          - php-mysqlnd 
+          - php-pgsql 
+          - php-pecl-mongodb 
+          - php-pecl-redis 
+          - php-pecl-memcache 
+          - php-pecl-memcached 
+          - php-gd 
+          - php-mbstring 
+          - php-mcrypt 
+          - php-xml
+          - mariadb-server
+          - mariadb
+        become: true
+
+      - name: debug vars!!!!!!!!!
+        debug:
+          var: vars
+
+      - name: Copy Nginx configuration file to remote server
+        synchronize: 
+          src: template/{{ item }}
+          dest: /home/ec2-user/
+        with_items:
+          - compucorp.conf
+          - compucorp_ssl.conf
+
+      - name: Move the configuration file to /etc/nginx/conf.d
+        command: cp /home/ec2-user/compucorp.conf /etc/nginx/conf.d/
+        become: true
+
+      - name: Change SELinux permissions
+        command: chcon -Rt httpd_sys_content_t /etc/nginx/conf.d/compucorp.conf
+        become: true
+
+      - name: Enable and start Nginx
+        service: 
+          name: nginx
+          state: started
+          enabled: yes
+        become: yes
+
+      - name: Enable and start Mariadb
+        service: 
+          name: mariadb
+          state: started
+          enabled: yes
+        become: yes
+
+      - name: Install Certbot because we need it to install Letsencrypt certificate
+        yum: name={{ item }} state=present
+        with_items: 
+          - certbot
+          - python2-certbot-nginx
+        become: true
+
+      - name: Generate Letsencrypt certificates
+        command: sudo certbot -n --agree-tos --email root@cca3.compucorp.neimportant.ro -d cca3.compucorp.neimportant.ro --nginx certonly
+
+      - name: Renew certificates automatically
+        cron: 
+          name: "renew certificates"
+          minute: "0"
+          hour: "0"
+          job: "certbot renew"
+
+      - name: Generate Strong Diffie-Hellman Group
+        command: openssl dhparam -out /etc/ssl/certs/dhparam.pem 2048
+        become: true
+
+      - name: Move the configuration file with SSL to /etc/nginx/conf.d
+        command: cp /home/ec2-user/compucorp_ssl.conf /etc/nginx/conf.d/
+        become: true
+
+      - name: Disable the configuration file with NO SSL
+        command: rm -rf /home/ec2-user/compucorp.conf
+        become: true
+
+      - name: Change SELinux permissions
+        command: chcon -Rt httpd_sys_content_t /etc/nginx/conf.d/compucorp_ssl.conf
+        become: true
+
+      - name: Restart Nginx with new certificates and SSL
+        service: 
+          name: nginx
+          state: restarted
+        become: yes
+
+      - name: Start and enable PHP-FPM
+        service: 
+          name: php-fpm
+          state: started
+          enabled: yes
+        become: yes
+
+      - name: Create writable directory for drupal installation
+        file: 
+          path: /var/www/compucorp
+          state: directory
+          owner: ec2-user
+          group: ec2-user
+          mode: 0755
+        become: true
+
+      - name: Install boto on the remote server because it seems that we need it for downloading files from S3 buckets
+        yum: name=python-boto state=present
+        become: true
+
+      - name: Download databases from S3 bucket
+        s3: 
+          aws_access_key: "{{ec2_access_key}}"
+          aws_secret_key: "{{ec2_secret_key}}"
+          region: us-east-1
+          bucket: ggaleata 
+          object: "{{ item }}"
+          dest: "{{ item }}"
+          mode: get
+        with_items:
+          - civicrm.mysql
+          - drupal.mysql
+
+      - name: Clone Drupal and CiviCRM repo from Github 
+        git: 
+          repo: git://github.com/limones1319/cmcrp.git
+          dest: /var/www/compucorp/html
+          key_file: .ssh/github_key
+
+      - name: Change SELinux permissions
+        command: chcon -t httpd_sys_rw_content_t -R /var/www/compucorp
+        become: true
+
+      - name: Change owner of files and private directories
+        command: chown -R apache:apache {{ item }}
+        with_items:
+          - /var/www/compucorp/html/sites/default/files
+          - /var/www/compucorp/html/sites/default/private
+        become: true
+
+      - name: Install MySQL-python on the remote server because we need it to restore the databases
+        yum: name=MySQL-python state=present
+        become: true
+
+      - name: Restore Drupal database
+        mysql_db:
+          login_user: root
+          name: db_drupal
+          state: import
+          target: drupal.mysql
+
+      - name: Restore CiviCRM database
+        mysql_db:
+          login_user: root
+          name: db_civicrm
+          state: import
+          target: civicrm.mysql         
+
+      - name: Create Drupal mysql user
+        mysql_user:
+          login_user: root
+          name: compucorp
+          password: "{{ drupal_db_pass }}"
+          priv: 'db_drupal.*:ALL'
+          state: present 
+
+      - name: Create CiviCRM mysql user
+        mysql_user:
+          login_user: root
+          name: compucorp_civi
+          password: "{{ civi_db_pass }}"
+          priv: 'db_civicrm.*:ALL'
+          state: present 
+

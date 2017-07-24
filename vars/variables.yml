@@ -1,0 +1,5 @@
+app_code_user: "compucorp" # remote user
+aws_region: us-east-2 # AWS region, where instance will be created
+instance_type: t2.micro  # AWS instance type
+ami: ami-11aa8c74  # AMI id, example uses Ubuntu 14.04.1 LTS
+project_name: compucorp_automation
